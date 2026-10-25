@@ -1,0 +1,51 @@
+# vision-ocr-api + Ollama on one GPU.
+#
+#   cp .env.example .env
+#   docker compose up -d --build
+#   docker compose exec ollama ollama pull qwen2.5vl:7b-q4_K_M
+#
+# If you already run Ollama elsewhere (e.g. natively in WSL), delete the
+# `ollama` service below and set VISION_OLLAMA_URL=http://host.docker.internal:11434.
+
+services:
+  vision:
+    build: .
+    image: vision-ocr-api:latest
+    container_name: vision-ocr-api
+    restart: unless-stopped
+    ports:
+      - "${VISION_HOST_PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      VISION_OLLAMA_URL: ${VISION_OLLAMA_URL:-http://ollama:11434}
+    extra_hosts:
+      # Lets the container reach an Ollama running on the WSL/Linux host.
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama-vision
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    environment:
+      # Keep the VLM resident briefly, then free VRAM for other workloads
+      # (e.g. a Whisper container on the same card).
+      OLLAMA_KEEP_ALIVE: 60s
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_FLASH_ATTENTION: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  ollama:

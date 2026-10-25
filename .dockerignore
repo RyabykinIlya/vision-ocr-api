@@ -1,0 +1,11 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+.DS_Store
+.env
+examples/*.png
+examples/*.jpg
+examples/*.jpeg
+README.md
