@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     # How long we wait for Ollama to answer a single request.
     request_timeout_seconds: float = 300.0
 
+    # Self-healing for the Ollama "prediction aborted, token repeat limit
+    # reached" failure, where the runner poisons its state after a few
+    # image requests (https://github.com/ollama/ollama/issues/18609).
+    # The service unloads the model (keep_alive=0) and retries. 0 disables.
+    abort_retries: int = 2
+
     # Image handling. Downscaling keeps VRAM/latency predictable; set
     # max_image_side=0 to disable resizing entirely.
     max_image_side: int = 1600

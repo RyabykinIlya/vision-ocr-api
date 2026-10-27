@@ -1,13 +1,29 @@
 """Thin async client for the Ollama chat API."""
 from __future__ import annotations
 
+import asyncio
+import logging
+
 import httpx
 
 from .config import Settings
 
+log = logging.getLogger("vision_ocr_api.ollama")
+
+# Markers of the Ollama runner bug where a reused slot poisons generation
+# and every request aborts with "prediction aborted, token repeat limit
+# reached" (https://github.com/ollama/ollama/issues/18609). Unloading the
+# model and retrying heals it.
+_REPEAT_ABORT_MARKERS = ("repeat limit reached", "prediction aborted")
+
 
 class OllamaError(RuntimeError):
     """Raised when Ollama is unreachable or returns an error."""
+
+
+def _is_repeat_abort(exc: OllamaError) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _REPEAT_ABORT_MARKERS)
 
 
 class OllamaClient:
@@ -37,7 +53,50 @@ class OllamaClient:
         data = resp.json()
         return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
 
+    async def unload_model(self, model: str) -> None:
+        """Ask Ollama to evict the model (keep_alive=0) and wait briefly.
+
+        Used to recover from the runner-side repeat-abort bug; a subsequent
+        request starts with a freshly loaded model.
+        """
+        try:
+            await self._client.post(
+                "/api/generate", json={"model": model, "keep_alive": 0, "stream": False}
+            )
+        except httpx.HTTPError as exc:
+            log.warning("could not unload model %r: %s", model, exc)
+            return
+        await asyncio.sleep(1.0)
+
     async def chat_with_images(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        images_b64: list[str],
+    ) -> str:
+        attempts = max(1, self._settings.abort_retries + 1)
+        last_exc: OllamaError | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._chat_once(
+                    model=model, prompt=prompt, images_b64=images_b64
+                )
+            except OllamaError as exc:
+                last_exc = exc
+                if attempt >= attempts or not _is_repeat_abort(exc):
+                    raise
+                log.warning(
+                    "ollama repeat-abort (attempt %d/%d) on model %r; "
+                    "unloading model and retrying",
+                    attempt,
+                    attempts,
+                    model,
+                )
+                await self.unload_model(model)
+        raise last_exc  # pragma: no cover - loop always returns or raises
+
+    async def _chat_once(
         self,
         *,
         model: str,

@@ -113,6 +113,7 @@ Every setting is an env var with the `VISION_` prefix; see `.env.example`.
 | `VISION_MAX_IMAGE_SIDE` | `1600` | Long-edge downscale, `0` disables |
 | `VISION_MAX_CONCURRENT_REQUESTS` | `1` | In-flight requests (one GPU = no gain from more) |
 | `VISION_MAX_UPLOAD_MB` | `25` | Per-image limit |
+| `VISION_ABORT_RETRIES` | `2` | Retries with a model unload when Ollama aborts with "token repeat limit reached" |
 | `VISION_HOST_PORT` | `8080` | Published port (Compose) |
 
 ## Model choice
@@ -168,7 +169,12 @@ publish it to the internet without putting a reverse proxy with auth in front.
 ## Notes
 
 - Images are re-encoded: JPEG (quality 95) unless the source has alpha, then PNG.
-  EXIF orientation is applied, so phone photos are not sideways.
+  EXIF orientation is applied, so phone photos are not sideways. HEIC/HEIF
+  (iPhone photos) are decoded via pillow-heif.
+- If Ollama starts failing every request with `prediction aborted, token repeat
+  limit reached` (a runner-state bug in recent Ollama builds), the service
+  unloads the model and retries automatically — `VISION_ABORT_RETRIES` controls
+  how many times (0 disables).
 - Nothing is written to disk — uploads are processed in memory.
 - Requests are serialized by default; a single GPU gains nothing from parallel
   decode, and queueing keeps VRAM predictable.

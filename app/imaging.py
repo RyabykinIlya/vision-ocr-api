@@ -7,6 +7,14 @@ from dataclasses import dataclass
 
 from PIL import Image, ImageOps
 
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+    HEIF_SUPPORTED = True
+except ImportError:  # pragma: no cover - pillow-heif is in requirements.txt
+    HEIF_SUPPORTED = False
+
 
 class ImageProcessingError(ValueError):
     pass
