@@ -22,13 +22,15 @@ services:
     extra_hosts:
       # Lets the container reach an Ollama running on the WSL/Linux host.
       - "host.docker.internal:host-gateway"
-    depends_on:
-      - ollama
 
+  # Bundled Ollama for the classic all-in-one setup (see README "Sharing the
+  # GPU"). Only starts with --profile bundled; point VISION_OLLAMA_URL at an
+  # existing Ollama otherwise.
   ollama:
     image: ollama/ollama:latest
     container_name: ollama-vision
     restart: unless-stopped
+    profiles: ["bundled"]
     ports:
       - "11434:11434"
     volumes:
@@ -46,6 +48,35 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # Nightly archive indexer. Independent of `vision` at the code level;
+  # they share only this compose file and the GPU behind it.
+  # Armed by INDEXER_ENABLED=true in .env; see indexer/README.md.
+  indexer:
+    build: ./indexer
+    image: vision-indexer:latest
+    container_name: vision-indexer
+    restart: unless-stopped
+    # Bind-mounted /data is owned by the host user (uid 1000 in WSL).
+    user: "1000:1000"
+    depends_on:
+      vision:
+        condition: service_healthy
+    environment:
+      INDEXER_ENABLED: ${INDEXER_ENABLED:-false}
+      INDEXER_MEDIA_DIR: /media
+      INDEXER_DB_PATH: /data/index.db
+      INDEXER_API_URL: http://vision:8080
+      INDEXER_MODEL: ${INDEXER_MODEL:-qwen2.5vl:3b}
+      INDEXER_FALLBACK_MODEL: ${INDEXER_FALLBACK_MODEL:-qwen2.5vl:7b-q4_K_M}
+      INDEXER_PROMPTS: ${INDEXER_PROMPTS:-scene,objects}
+      INDEXER_WINDOW: ${INDEXER_WINDOW:-00:00-07:00}
+      INDEXER_TZ: ${INDEXER_TZ:-Europe/Moscow}
+      TZ: ${INDEXER_TZ:-Europe/Moscow}
+    volumes:
+      # Windows media archive, read-only. Host path comes from .env.
+      - ${INDEXER_MEDIA_HOST:-/mnt/d/home_share/медиа}:/media:ro
+      - ./indexer/data:/data
 
 volumes:
   ollama:
