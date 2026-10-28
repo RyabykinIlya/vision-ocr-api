@@ -365,6 +365,8 @@ def main() -> None:
                         help="reset failed images so they are retried")
     parser.add_argument("--only", nargs="+", default=None, metavar="PATH",
                         help="index exactly these paths (relative to the media root)")
+    parser.add_argument("--only-file", default=None, metavar="FILE",
+                        help="same as --only, paths read one-per-line from FILE")
     parser.add_argument("--redo", action="store_true",
                         help="re-index everything already in the db (refresh prompts)")
     args = parser.parse_args()
@@ -391,10 +393,14 @@ def main() -> None:
         log.info("reset %d failed image(s) for retry", n)
 
     if args.once:
-        if args.only:
+        only_paths = list(args.only or [])
+        if args.only_file:
+            with open(args.only_file, encoding="utf-8") as fh:
+                only_paths += [ln.strip() for ln in fh if ln.strip()]
+        if only_paths:
             todo = []
             disk = ix.scan()
-            for p in args.only:
+            for p in only_paths:
                 if p in disk:
                     todo.append((p, disk[p][0], disk[p][1]))
                 else:
