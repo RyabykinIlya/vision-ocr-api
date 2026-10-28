@@ -60,27 +60,94 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
 STOP = False
 
 
-def _normalize_objects(raw: str) -> str:
-    """Bring the objects list to one-object-per-line, deduplicated.
+def _collapse_repeats(raw: str, max_reps: int = 1) -> str:
+    """Cut text that repeats the same sentence/line over and over.
 
-    The model is asked for strict line format but sometimes answers with
-    comma-separated runs anyway; splitting and deduping here makes the
-    stored format uniform (and kills most loop artifacts).
+    Second line of defence after the service-side loop guard: a degenerate
+    generation must not reach the index even if it slipped through. Keeps
+    the first `max_reps` occurrences and drops the rest, preserving order.
     """
-    items = [t.strip(" .;") for t in re.split(r"[,;\n]| \| |\. ", raw) if t.strip(" .;,|")]
-    # strip "1 ", "2)"-style numbering the model sometimes adds
-    items = [re.sub(r"^\d+[).]?\s*", "", t) for t in items]
-    # drop items cut mid-word by the loop guard: a real item ends with a letter
-    items = [t for t in items if t and t[-1].isalpha()]
+    segs = re.split(r"(?<=[.!?])\s+|\n", raw)
+    counts: dict[str, int] = {}
+    out: list[str] = []
+    dropped = 0
+    for seg in segs:
+        key = seg.strip()
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        if counts[key] <= max_reps:
+            out.append(key)
+        else:
+            dropped += 1
+    if dropped >= 3:
+        log.warning("collapsed %d repeated segment(s) in generated text", dropped)
+    return "\n".join(out)
+
+
+def _normalize_objects(raw: str) -> str:
+    """Bring the objects answer to one-item-per-line, deduplicated.
+
+    Handles the two-section prompt output ("Люди:" / "Объекты:") as well as
+    plain comma-separated runs the model sometimes falls back to. Items cut
+    mid-word by the loop guard are dropped.
+    """
+    lines: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip().strip("*#-").strip()
+        if not stripped:
+            continue
+        # section headers are kept as-is, they are useful in the index
+        if stripped.rstrip(":").lower() in ("люди", "объекты", "предметы", "people", "objects"):
+            lines.append(stripped if stripped.endswith(":") else stripped + ":")
+            continue
+        parts = [p.strip(" .;") for p in re.split(r"[,;]| \| ", stripped) if p.strip(" .;,|")]
+        for p in parts:
+            p = re.sub(r"^\d+[).]?\s*", "", p)
+            if p:
+                lines.append(p)
+
     seen: set[str] = set()
     out: list[str] = []
-    for it in items:
+    for it in lines:
+        if it.endswith(":") and it.lower().rstrip(":") in ("люди", "объекты", "предметы"):
+            out.append(it)
+            continue
+        it = it.rstrip(" .;")
+        # drop fragments cut mid-word (loop guard): an item ends with a letter
+        if not it or not it[-1].isalpha():
+            continue
         key = it.lower()
         if key in seen:
             continue
         seen.add(key)
         out.append(it)
-    return "\n".join(out[:20])
+
+    # a truncated tail like "челов" is a prefix of a real item ("человек")
+    stems = {i.lower() for i in out if not i.endswith(":")}
+    out = [
+        i for i in out
+        if i.endswith(":")
+        or not any(o != i.lower() and o.startswith(i.lower()) and len(o) > len(i) for o in stems)
+    ]
+
+    # terminal alternation loop (A-B-A-B-...): keep one pass over the cycle
+    if len(out) >= 7:
+        tail = out[-6:]
+        if len(set(tail)) <= 2:
+            cycle = out[-2:]
+            cut = len(out)
+            while cut >= 2 and out[cut - 2:cut] == cycle:
+                cut -= 2
+            if cut < len(out) - 2:
+                log.warning(
+                    "collapsed alternation loop in objects list (%d -> %d items)",
+                    len(out),
+                    cut + 2,
+                )
+                out = out[: cut + 2]
+
+    return "\n".join(out[:24])
 
 
 def _handle_signal(signum, _frame):
@@ -162,8 +229,10 @@ class Indexer:
                 content, err = self._ask(prompt, self.fallback_model, abs_path)
             if content is None:
                 errors.append(f"{key}: {err}")
+            elif key == "objects":
+                texts[key] = _normalize_objects(content)
             else:
-                texts[key] = content if key != "objects" else _normalize_objects(content)
+                texts[key] = _collapse_repeats(content, max_reps=1)
         elapsed = time.monotonic() - t0
 
         with self.db:  # one transaction per image

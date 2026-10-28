@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 
 import httpx
 
@@ -22,23 +23,41 @@ _REPEAT_ABORT_MARKERS = (
 
 
 def _detect_loop(text: str, min_unit: int = 8, max_unit: int = 90, reps: int = 4) -> bool:
-    """True if the text ends with the same fragment repeated `reps` times.
+    """True if the text tail is the same fragment repeated over and over.
 
-    Catches the degenerate loops small VLMs fall into on hard images
-    ("снег, фонари, здания, снег, фонари, здания, ..."). Only looks at the
-    tail, so it is cheap to run on every stream chunk.
+    Two independent checks, because degenerate generations come in two
+    shapes:
+
+    * exact repetition, possibly cut mid-unit (the stream ends or
+      num_predict runs out inside the repeated phrase) — handled by
+      testing suffixes with a small offset;
+    * the same *sentence* recurring a few times in the tail — handled by a
+      simple frequency count over sentence-sized segments.
     """
-    tail = text[-(max_unit * reps):]
+    # 1) suffix repetition, tolerating a partial trailing unit
+    window = text[-(max_unit * reps + max_unit):]
     for unit_len in range(min_unit, max_unit + 1):
-        unit = tail[-unit_len:]
-        if len(unit) < unit_len:
-            continue
-        count = 0
-        i = len(tail)
-        while i >= unit_len and tail[i - unit_len:i] == unit:
-            count += 1
-            i -= unit_len
-        if count >= reps:
+        for offset in range(0, min(unit_len, 40)):
+            tail = window[: len(window) - offset] if offset else window
+            if len(tail) < unit_len * reps:
+                continue
+            unit = tail[-unit_len:]
+            count = 0
+            i = len(tail)
+            while i >= unit_len and tail[i - unit_len:i] == unit:
+                count += 1
+                i -= unit_len
+            if count >= reps:
+                return True
+
+    # 2) same sentence repeated in the tail
+    tail = text[-800:]
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n", tail) if len(s.strip()) >= 15]
+    if sentences:
+        counts: dict[str, int] = {}
+        for s in sentences:
+            counts[s] = counts.get(s, 0) + 1
+        if max(counts.values()) >= 3:
             return True
     return False
 
