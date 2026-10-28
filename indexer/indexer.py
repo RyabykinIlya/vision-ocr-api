@@ -369,6 +369,8 @@ def main() -> None:
                         help="same as --only, paths read one-per-line from FILE")
     parser.add_argument("--redo", action="store_true",
                         help="re-index everything already in the db (refresh prompts)")
+    parser.add_argument("--stale", action="store_true",
+                        help="re-index only rows made with a different model or failed")
     args = parser.parse_args()
 
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -413,11 +415,21 @@ def main() -> None:
                     ix.index_one(rel, mtime, size)
                 except Exception:  # noqa: BLE001
                     log.exception("unexpected error on %s", rel)
-        elif args.redo:
+        elif args.redo or args.stale:
             disk = ix.scan()
-            known = [r["path"] for r in ix.db.execute("SELECT path FROM images ORDER BY path")]
+            if args.stale:
+                # only rows indexed by a different model, or not ok
+                known = [
+                    r["path"]
+                    for r in ix.db.execute("SELECT path, model, status FROM images ORDER BY path")
+                    if r["model"] != ix.model or r["status"] != "ok"
+                ]
+                label = "--stale"
+            else:
+                known = [r["path"] for r in ix.db.execute("SELECT path FROM images ORDER BY path")]
+                label = "--redo"
             todo = [(p, disk[p][0], disk[p][1]) for p in known if p in disk]
-            log.info("pass (--redo): %d already-indexed image(s) to refresh", len(todo))
+            log.info("pass (%s): %d image(s) to refresh", label, len(todo))
             for i, (rel, mtime, size) in enumerate(todo, 1):
                 if STOP:
                     break

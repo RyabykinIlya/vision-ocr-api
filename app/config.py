@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     num_predict: int = 2048
     temperature: float = 0.0
 
+    # Reasoning ("thinking") models such as qwen3-vl spend the token budget
+    # on hidden reasoning before writing the answer: with a small num_predict
+    # the content comes back empty. Disable reasoning when the model supports
+    # it, and give the runner enough headroom when it does not.
+    think: bool | None = None
+
     # How long we wait for Ollama to answer a single request.
     request_timeout_seconds: float = 300.0
 

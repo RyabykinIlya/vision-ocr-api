@@ -19,6 +19,10 @@ log = logging.getLogger("vision_ocr_api.ollama")
 _REPEAT_ABORT_MARKERS = (
     "repeat limit reached",
     "prediction aborted",
+    # A reasoning model can spend the whole num_predict budget on hidden
+    # reasoning and finish with no visible content. It is transient (the
+    # next attempt usually answers), so treat it as retryable.
+    "empty response",
 )
 
 
@@ -68,7 +72,12 @@ class OllamaError(RuntimeError):
 
 def _is_repeat_abort(exc: OllamaError) -> bool:
     text = str(exc).lower()
-    return any(marker in text for marker in _REPEAT_ABORT_MARKERS)
+    return any(marker in text for marker in ("repeat limit reached", "prediction aborted"))
+
+
+def _is_empty_answer(exc: OllamaError) -> bool:
+    """A reasoning model burned its budget on hidden reasoning."""
+    return "empty response" in str(exc).lower()
 
 
 class OllamaClient:
@@ -122,23 +131,42 @@ class OllamaClient:
     ) -> str:
         attempts = max(1, self._settings.abort_retries + 1)
         last_exc: OllamaError | None = None
+        budget = self._settings.num_predict
         for attempt in range(1, attempts + 1):
             try:
                 return await self._chat_streaming(
-                    model=model, prompt=prompt, images_b64=images_b64
+                    model=model, prompt=prompt, images_b64=images_b64, budget=budget
                 )
             except OllamaError as exc:
                 last_exc = exc
-                if attempt >= attempts or not _is_repeat_abort(exc):
+                if attempt >= attempts:
                     raise
-                log.warning(
-                    "ollama repeat-abort (attempt %d/%d) on model %r; "
-                    "unloading model and retrying",
-                    attempt,
-                    attempts,
-                    model,
-                )
-                await self.unload_model(model)
+                if _is_repeat_abort(exc):
+                    # Runner state is poisoned: unload so the retry starts clean.
+                    log.warning(
+                        "ollama repeat-abort (attempt %d/%d) on model %r; "
+                        "unloading model and retrying",
+                        attempt,
+                        attempts,
+                        model,
+                    )
+                    await self.unload_model(model)
+                elif _is_empty_answer(exc):
+                    # The reasoning model spent the whole token budget on
+                    # hidden reasoning. The model is fine, just give the retry
+                    # more room (only for this request, not globally).
+                    new_budget = min(budget * 2, 16384)
+                    log.warning(
+                        "empty answer (attempt %d/%d) on model %r: budget likely "
+                        "spent on reasoning; retrying with num_predict %d",
+                        attempt,
+                        attempts,
+                        model,
+                        new_budget,
+                    )
+                    budget = new_budget
+                else:
+                    raise
         raise last_exc  # pragma: no cover - loop always returns or raises
 
     async def _chat_streaming(
@@ -147,6 +175,7 @@ class OllamaClient:
         model: str,
         prompt: str,
         images_b64: list[str],
+        budget: int | None = None,
     ) -> str:
         """Stream the answer so a runaway generation can be cut early.
 
@@ -171,9 +200,12 @@ class OllamaClient:
             "options": {
                 "temperature": self._settings.temperature,
                 "num_ctx": self._settings.num_ctx,
-                "num_predict": self._settings.num_predict,
+                "num_predict": budget if budget is not None else self._settings.num_predict,
             },
         }
+        if self._settings.think is not None:
+            # Reasoning models: false makes ollama hide the reasoning trace.
+            payload["think"] = self._settings.think
 
         parts: list[str] = []
         checked_at = 0
