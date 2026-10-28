@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     # The service unloads the model (keep_alive=0) and retries. 0 disables.
     abort_retries: int = 2
 
+    # Stream generations and cut the connection when the model falls into a
+    # degenerate loop (the same fragment repeated over and over). The partial
+    # text is returned; the GPU stops burning as soon as we disconnect.
+    loop_guard: bool = True
+
     # Image handling. Downscaling keeps VRAM/latency predictable; set
     # max_image_side=0 to disable resizing entirely.
     max_image_side: int = 1600

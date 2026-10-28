@@ -17,6 +17,7 @@ import argparse
 import logging
 import os
 import random
+import re
 import signal
 import sqlite3
 import sys
@@ -57,6 +58,29 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
 """
 
 STOP = False
+
+
+def _normalize_objects(raw: str) -> str:
+    """Bring the objects list to one-object-per-line, deduplicated.
+
+    The model is asked for strict line format but sometimes answers with
+    comma-separated runs anyway; splitting and deduping here makes the
+    stored format uniform (and kills most loop artifacts).
+    """
+    items = [t.strip(" .;") for t in re.split(r"[,;\n]| \| |\. ", raw) if t.strip(" .;,|")]
+    # strip "1 ", "2)"-style numbering the model sometimes adds
+    items = [re.sub(r"^\d+[).]?\s*", "", t) for t in items]
+    # drop items cut mid-word by the loop guard: a real item ends with a letter
+    items = [t for t in items if t and t[-1].isalpha()]
+    seen: set[str] = set()
+    out: list[str] = []
+    for it in items:
+        key = it.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return "\n".join(out[:20])
 
 
 def _handle_signal(signum, _frame):
@@ -139,7 +163,7 @@ class Indexer:
             if content is None:
                 errors.append(f"{key}: {err}")
             else:
-                texts[key] = content
+                texts[key] = content if key != "objects" else _normalize_objects(content)
         elapsed = time.monotonic() - t0
 
         with self.db:  # one transaction per image
@@ -270,6 +294,8 @@ def main() -> None:
                         help="delete the database first (trial runs)")
     parser.add_argument("--retry-failed", action="store_true",
                         help="reset failed images so they are retried")
+    parser.add_argument("--only", nargs="+", default=None, metavar="PATH",
+                        help="index exactly these paths (relative to the media root)")
     args = parser.parse_args()
 
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -294,7 +320,24 @@ def main() -> None:
         log.info("reset %d failed image(s) for retry", n)
 
     if args.once:
-        ix.run_pass(limit=args.limit, sample_seed=args.sample)
+        if args.only:
+            todo = []
+            disk = ix.scan()
+            for p in args.only:
+                if p in disk:
+                    todo.append((p, disk[p][0], disk[p][1]))
+                else:
+                    log.warning("not found on disk: %s", p)
+            log.info("pass (--only): %d image(s)", len(todo))
+            for i, (rel, mtime, size) in enumerate(todo, 1):
+                if STOP:
+                    break
+                try:
+                    ix.index_one(rel, mtime, size)
+                except Exception:  # noqa: BLE001
+                    log.exception("unexpected error on %s", rel)
+        else:
+            ix.run_pass(limit=args.limit, sample_seed=args.sample)
         log.info(ix.stats())
         return
 

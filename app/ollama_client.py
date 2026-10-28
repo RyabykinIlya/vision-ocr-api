@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 import httpx
@@ -14,7 +15,32 @@ log = logging.getLogger("vision_ocr_api.ollama")
 # and every request aborts with "prediction aborted, token repeat limit
 # reached" (https://github.com/ollama/ollama/issues/18609). Unloading the
 # model and retrying heals it.
-_REPEAT_ABORT_MARKERS = ("repeat limit reached", "prediction aborted")
+_REPEAT_ABORT_MARKERS = (
+    "repeat limit reached",
+    "prediction aborted",
+)
+
+
+def _detect_loop(text: str, min_unit: int = 8, max_unit: int = 90, reps: int = 4) -> bool:
+    """True if the text ends with the same fragment repeated `reps` times.
+
+    Catches the degenerate loops small VLMs fall into on hard images
+    ("снег, фонари, здания, снег, фонари, здания, ..."). Only looks at the
+    tail, so it is cheap to run on every stream chunk.
+    """
+    tail = text[-(max_unit * reps):]
+    for unit_len in range(min_unit, max_unit + 1):
+        unit = tail[-unit_len:]
+        if len(unit) < unit_len:
+            continue
+        count = 0
+        i = len(tail)
+        while i >= unit_len and tail[i - unit_len:i] == unit:
+            count += 1
+            i -= unit_len
+        if count >= reps:
+            return True
+    return False
 
 
 class OllamaError(RuntimeError):
@@ -79,7 +105,7 @@ class OllamaClient:
         last_exc: OllamaError | None = None
         for attempt in range(1, attempts + 1):
             try:
-                return await self._chat_once(
+                return await self._chat_streaming(
                     model=model, prompt=prompt, images_b64=images_b64
                 )
             except OllamaError as exc:
@@ -96,16 +122,25 @@ class OllamaClient:
                 await self.unload_model(model)
         raise last_exc  # pragma: no cover - loop always returns or raises
 
-    async def _chat_once(
+    async def _chat_streaming(
         self,
         *,
         model: str,
         prompt: str,
         images_b64: list[str],
     ) -> str:
+        """Stream the answer so a runaway generation can be cut early.
+
+        Consumes ollama's NDJSON stream, watches the accumulated text and, if
+        the same fragment repeats consecutively (a degenerate loop small VLMs
+        fall into), drops the connection. Ollama stops generating on
+        disconnect, so the GPU is freed immediately instead of grinding to
+        num_predict. As a bonus the read timeout now applies per token batch,
+        not to the whole generation.
+        """
         payload = {
             "model": model,
-            "stream": False,
+            "stream": True,
             "keep_alive": self._settings.keep_alive,
             "messages": [
                 {
@@ -121,29 +156,64 @@ class OllamaClient:
             },
         }
 
+        parts: list[str] = []
+        checked_at = 0
+
         try:
-            resp = await self._client.post("/api/chat", json=payload)
+            async with self._client.stream("POST", "/api/chat", json=payload) as resp:
+                if resp.status_code >= 400:
+                    body = (await resp.aread()).decode(errors="replace")
+                    raise OllamaError(
+                        f"Ollama returned HTTP {resp.status_code}: {body.strip()[:800]}"
+                    )
+                async for line in resp.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(data.get("error"), str):
+                        raise OllamaError(data["error"])
+                    chunk = (data.get("message") or {}).get("content")
+                    if chunk:
+                        parts.append(chunk)
+                    if data.get("done"):
+                        break
+                    text = "".join(parts)
+                    if (
+                        self._settings.loop_guard
+                        and len(text) - checked_at >= 32
+                        and _detect_loop(text)
+                    ):
+                        log.warning(
+                            "generation loop detected after %d chars on %r; "
+                            "cutting the stream",
+                            len(text),
+                            model,
+                        )
+                        if len(text) < 40:
+                            # Looped right from the start: the text is
+                            # useless. Retry through the repeat-abort path
+                            # (unload + fresh attempt).
+                            raise OllamaError(
+                                "local repeat limit reached: looped from the start"
+                            )
+                        return text.strip()  # partial but usable
+                    checked_at = len(text)
         except httpx.TimeoutException as exc:
+            if parts:
+                # Tokens were flowing but stalled mid-generation; keep what
+                # we have rather than failing the whole request.
+                log.warning("stream stalled mid-generation, keeping %d chars", len("".join(parts)))
+                return "".join(parts).strip()
             raise OllamaError(
                 f"Ollama did not answer within {self._settings.request_timeout_seconds}s"
             ) from exc
         except httpx.HTTPError as exc:
             raise OllamaError(f"could not reach Ollama: {exc}") from exc
 
-        if resp.status_code >= 400:
-            detail = resp.text.strip()[:800]
-            raise OllamaError(f"Ollama returned HTTP {resp.status_code}: {detail}")
-
-        try:
-            data = resp.json()
-        except ValueError as exc:
-            raise OllamaError("Ollama returned a non-JSON response") from exc
-
-        if isinstance(data.get("error"), str):
-            raise OllamaError(data["error"])
-
-        message = data.get("message") or {}
-        content = message.get("content")
-        if not isinstance(content, str) or not content.strip():
+        text = "".join(parts).strip()
+        if not text:
             raise OllamaError("Ollama returned an empty response")
-        return content.strip()
+        return text
