@@ -365,6 +365,8 @@ def main() -> None:
                         help="reset failed images so they are retried")
     parser.add_argument("--only", nargs="+", default=None, metavar="PATH",
                         help="index exactly these paths (relative to the media root)")
+    parser.add_argument("--redo", action="store_true",
+                        help="re-index everything already in the db (refresh prompts)")
     args = parser.parse_args()
 
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -405,6 +407,20 @@ def main() -> None:
                     ix.index_one(rel, mtime, size)
                 except Exception:  # noqa: BLE001
                     log.exception("unexpected error on %s", rel)
+        elif args.redo:
+            disk = ix.scan()
+            known = [r["path"] for r in ix.db.execute("SELECT path FROM images ORDER BY path")]
+            todo = [(p, disk[p][0], disk[p][1]) for p in known if p in disk]
+            log.info("pass (--redo): %d already-indexed image(s) to refresh", len(todo))
+            for i, (rel, mtime, size) in enumerate(todo, 1):
+                if STOP:
+                    break
+                try:
+                    ix.index_one(rel, mtime, size)
+                except Exception:  # noqa: BLE001
+                    log.exception("unexpected error on %s", rel)
+                if i % 10 == 0 or i == len(todo):
+                    log.info("progress: %d/%d", i, len(todo))
         else:
             ix.run_pass(limit=args.limit, sample_seed=args.sample)
         log.info(ix.stats())
